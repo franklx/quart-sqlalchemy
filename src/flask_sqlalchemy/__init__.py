@@ -2,58 +2,38 @@ import functools
 import os
 import sys
 import warnings
+from contextlib import asynccontextmanager
 from math import ceil
 from operator import itemgetter
 from threading import Lock
 from time import perf_counter
 
 import sqlalchemy
-from flask import _app_ctx_stack
-from flask import abort
-from flask import current_app
-from flask import request
-from flask.signals import Namespace
+from quart import _app_ctx_stack
+from quart import abort
+from quart import current_app
+from quart import request
+from quart.signals import Namespace
 from sqlalchemy import event
 from sqlalchemy import inspect
 from sqlalchemy import orm
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm.exc import UnmappedClassError
-from sqlalchemy.orm.session import Session as SessionBase
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_scoped_session
 
 from .model import DefaultMeta
 from .model import Model
 
-try:
-    from sqlalchemy.orm import declarative_base
-    from sqlalchemy.orm import DeclarativeMeta
-except ImportError:
-    # SQLAlchemy <= 1.3
-    from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.ext.declarative import DeclarativeMeta
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeMeta
 
-# Scope the session to the current greenlet if greenlet is available,
-# otherwise fall back to the current thread.
-try:
-    from greenlet import getcurrent as _ident_func
-except ImportError:
-    from threading import get_ident as _ident_func
+from asyncio import current_task as _ident_func
 
-__version__ = "3.0.0.dev0"
+__version__ = "1.0.0"
 
 _signals = Namespace()
 models_committed = _signals.signal("models-committed")
 before_models_committed = _signals.signal("before-models-committed")
-
-
-def _sa_url_set(url, **kwargs):
-    try:
-        url = url.set(**kwargs)
-    except AttributeError:
-        # SQLAlchemy <= 1.3
-        for key, value in kwargs.items():
-            setattr(url, key, value)
-
-    return url
 
 
 def _sa_url_query_setdefault(url, **kwargs):
@@ -62,7 +42,7 @@ def _sa_url_query_setdefault(url, **kwargs):
     for key, value in kwargs.items():
         query.setdefault(key, value)
 
-    return _sa_url_set(url, query=query)
+    return url.set(query=query)
 
 
 def _make_table(db):
@@ -138,7 +118,7 @@ def _calling_context(app_path):
     return "<unknown>"
 
 
-class SignallingSession(SessionBase):
+class SignallingSession(AsyncSession):
     """The signalling session is the default session that Flask-SQLAlchemy
     uses.  It extends the default session system with bind selection and
     modification tracking.
@@ -163,7 +143,7 @@ class SignallingSession(SessionBase):
         if track_modifications:
             _SessionSignalEvents.register(self)
 
-        SessionBase.__init__(
+        AsyncSession.__init__(
             self,
             autocommit=autocommit,
             autoflush=autoflush,
@@ -178,12 +158,7 @@ class SignallingSession(SessionBase):
         """
         # mapper is None if someone tries to just get a connection
         if mapper is not None:
-            try:
-                # SA >= 1.3
-                persist_selectable = mapper.persist_selectable
-            except AttributeError:
-                # SA < 1.3
-                persist_selectable = mapper.mapped_table
+            persist_selectable = mapper.persist_selectable
 
             info = getattr(persist_selectable, "info", {})
             bind_key = info.get("bind_key")
@@ -263,80 +238,6 @@ class _SessionSignalEvents:
             return
 
         d.clear()
-
-
-class _EngineDebuggingSignalEvents:
-    """Sets up handlers for two events that let us track the execution time of
-    queries."""
-
-    def __init__(self, engine, import_name):
-        self.engine = engine
-        self.app_package = import_name
-
-    def register(self):
-        event.listen(self.engine, "before_cursor_execute", self.before_cursor_execute)
-        event.listen(self.engine, "after_cursor_execute", self.after_cursor_execute)
-
-    def before_cursor_execute(
-        self, conn, cursor, statement, parameters, context, executemany
-    ):
-        if current_app:
-            context._query_start_time = perf_counter()
-
-    def after_cursor_execute(
-        self, conn, cursor, statement, parameters, context, executemany
-    ):
-        if current_app:
-            try:
-                queries = _app_ctx_stack.top.sqlalchemy_queries
-            except AttributeError:
-                queries = _app_ctx_stack.top.sqlalchemy_queries = []
-
-            queries.append(
-                _DebugQueryTuple(
-                    (
-                        statement,
-                        parameters,
-                        context._query_start_time,
-                        perf_counter(),
-                        _calling_context(self.app_package),
-                    )
-                )
-            )
-
-
-def get_debug_queries():
-    """In debug mode or testing mode, Flask-SQLAlchemy will log all the SQL
-    queries sent to the database. This information is available until the end
-    of request which makes it possible to easily ensure that the SQL generated
-    is the one expected on errors or in unittesting. Alternatively, you can also
-    enable the query recording by setting the ``'SQLALCHEMY_RECORD_QUERIES'``
-    config variable to `True`.
-
-    The value returned will be a list of named tuples with the following
-    attributes:
-
-    `statement`
-        The SQL statement issued
-
-    `parameters`
-        The parameters for the SQL statement
-
-    `start_time` / `end_time`
-        Time the query started / the results arrived.  Please keep in mind
-        that the timer function used depends on your platform. These
-        values are only useful for sorting or comparing.  They do not
-        necessarily represent an absolute timestamp.
-
-    `duration`
-        Time the query took in seconds
-
-    `context`
-        A string giving a rough estimation of where in your application
-        query was issued.  The exact format is undefined so don't try
-        to reconstruct filename or function name.
-    """
-    return getattr(_app_ctx_stack.top, "sqlalchemy_queries", [])
 
 
 class Pagination:
@@ -565,15 +466,6 @@ class _QueryProperty:
             return None
 
 
-def _record_queries(app):
-    if app.debug:
-        return True
-    rq = app.config["SQLALCHEMY_RECORD_QUERIES"]
-    if rq is not None:
-        return rq
-    return bool(app.config.get("TESTING"))
-
-
 class _EngineConnector:
     def __init__(self, sa, app, bind=None):
         self._sa = sa
@@ -602,11 +494,6 @@ class _EngineConnector:
             sa_url = make_url(uri)
             sa_url, options = self.get_options(sa_url, echo)
             self._engine = rv = self._sa.create_engine(sa_url, options)
-
-            if _record_queries(self._app):
-                _EngineDebuggingSignalEvents(
-                    self._engine, self._app.import_name
-                ).register()
 
             self._connected_for = (uri, echo)
 
@@ -668,7 +555,7 @@ class SQLAlchemy:
 
     The difference between the two is that in the first case methods like
     :meth:`create_all` and :meth:`drop_all` will work all the time but in
-    the second case a :meth:`flask.Flask.app_context` has to exist.
+    the second case a :meth:`quart.Flask.app_context` has to exist.
 
     By default Flask-SQLAlchemy will apply some backend-specific settings
     to improve your experience with them.
@@ -707,10 +594,6 @@ class SQLAlchemy:
 
     .. versionchanged:: 3.0
         Removed the ``use_native_unicode`` parameter and config.
-
-    .. versionchanged:: 3.0
-        ``COMMIT_ON_TEARDOWN`` is deprecated and will be removed in
-        version 3.1. Call ``db.session.commit()`` directly instead.
 
     .. versionchanged:: 2.4
         Added the ``engine_options`` parameter.
@@ -792,7 +675,7 @@ class SQLAlchemy:
 
         scopefunc = options.pop("scopefunc", _ident_func)
         options.setdefault("query_cls", self.Query)
-        return orm.scoped_session(self.create_session(options), scopefunc=scopefunc)
+        return async_scoped_session(self.create_session(options), scopefunc=scopefunc)
 
     def create_session(self, options):
         """Create the session factory used by :meth:`create_scoped_session`.
@@ -862,27 +745,14 @@ class SQLAlchemy:
         app.config.setdefault("SQLALCHEMY_DATABASE_URI", None)
         app.config.setdefault("SQLALCHEMY_BINDS", None)
         app.config.setdefault("SQLALCHEMY_ECHO", False)
-        app.config.setdefault("SQLALCHEMY_RECORD_QUERIES", None)
-        app.config.setdefault("SQLALCHEMY_COMMIT_ON_TEARDOWN", False)
         app.config.setdefault("SQLALCHEMY_TRACK_MODIFICATIONS", False)
         app.config.setdefault("SQLALCHEMY_ENGINE_OPTIONS", {})
 
         app.extensions["sqlalchemy"] = _SQLAlchemyState(self)
 
         @app.teardown_appcontext
-        def shutdown_session(response_or_exc):
-            if app.config["SQLALCHEMY_COMMIT_ON_TEARDOWN"]:
-                warnings.warn(
-                    "'COMMIT_ON_TEARDOWN' is deprecated and will be"
-                    " removed in version 3.1. Call"
-                    " 'db.session.commit()'` directly instead.",
-                    DeprecationWarning,
-                )
-
-                if response_or_exc is None:
-                    self.session.commit()
-
-            self.session.remove()
+        async def shutdown_session(response_or_exc):
+            await self.session.remove()
             return response_or_exc
 
     def apply_driver_hacks(self, app, sa_url, options):
@@ -937,9 +807,9 @@ class SQLAlchemy:
             # app instance path, which might need to be created.
             if not detected_in_memory and not os.path.isabs(sa_url.database):
                 os.makedirs(app.instance_path, exist_ok=True)
-                sa_url = _sa_url_set(
-                    sa_url, database=os.path.join(app.root_path, sa_url.database)
-                )
+                sa_url = sa_url.set(database=os.path.join(app.root_path, sa_url.database))
+        elif sa_url.drivername == "postgresql":
+            sa_url = sa_url.set(drivername="postgresql+asyncpg")
 
         return sa_url, options
 
@@ -980,7 +850,7 @@ class SQLAlchemy:
         ``'SQLALCHEMY_ENGINE_OPTIONS'`` config variable or set
         ``engine_options`` for :func:`SQLAlchemy`.
         """
-        return sqlalchemy.create_engine(sa_url, **engine_opts)
+        return create_async_engine(sa_url, **engine_opts)
 
     def get_app(self, reference_app=None):
         """Helper method that implements the logic to look up an
@@ -998,7 +868,7 @@ class SQLAlchemy:
         raise RuntimeError(
             "No application found. Either work inside a view function or push"
             " an application context. See"
-            " https://flask-sqlalchemy.palletsprojects.com/contexts/."
+            " https://quart-sqlalchemy.palletsprojects.com/contexts/."
         )
 
     def get_tables_for_bind(self, bind=None):
@@ -1023,7 +893,7 @@ class SQLAlchemy:
             retval.update({table: engine for table in tables})
         return retval
 
-    def _execute_for_all_tables(self, app, bind, operation, skip_tables=False):
+    async def _execute_for_all_tables(self, app, bind, operation, skip_tables=False):
         app = self.get_app(app)
 
         if bind == "__all__":
@@ -1039,9 +909,9 @@ class SQLAlchemy:
                 tables = self.get_tables_for_bind(bind)
                 extra["tables"] = tables
             op = getattr(self.Model.metadata, operation)
-            op(bind=self.get_engine(app, bind), **extra)
+            await op(bind=self.get_engine(app, bind), **extra)
 
-    def create_all(self, bind="__all__", app=None):
+    async def create_all(self, bind="__all__", app=None):
         """Create all tables that do not already exist in the database.
         This does not update existing tables, use a migration library
         for that.
@@ -1053,9 +923,9 @@ class SQLAlchemy:
         .. versionchanged:: 0.12
             Added the ``bind`` and ``app`` parameters.
         """
-        self._execute_for_all_tables(app, bind, "create_all")
+        await self._execute_for_all_tables(app, bind, "create_all")
 
-    def drop_all(self, bind="__all__", app=None):
+    async def drop_all(self, bind="__all__", app=None):
         """Drop all tables.
 
         :param bind: A bind key or list of keys to drop the tables for.
@@ -1065,9 +935,9 @@ class SQLAlchemy:
         .. versionchanged:: 0.12
             Added the ``bind`` and ``app`` parameters.
         """
-        self._execute_for_all_tables(app, bind, "drop_all")
+        await self._execute_for_all_tables(app, bind, "drop_all")
 
-    def reflect(self, bind="__all__", app=None):
+    async def reflect(self, bind="__all__", app=None):
         """Reflects tables from the database.
 
         :param bind: A bind key or list of keys to reflect the tables
@@ -1077,7 +947,30 @@ class SQLAlchemy:
         .. versionchanged:: 0.12
             Added the ``bind`` and ``app`` parameters.
         """
-        self._execute_for_all_tables(app, bind, "reflect", skip_tables=True)
+        await self._execute_for_all_tables(app, bind, "reflect", skip_tables=True)
+
+    async def commit(self):
+        await self.session.commit()
+
+    async def execute(self, statement, **params):
+        await self.session.execute(statement, params)
+
+    async def execute_many(self, statement, multi_params):
+        await self.session.execute(statement, multi_params)
+
+    async def fetch_one(self, statement, **params):
+        return (await self.session.execute(statement, params)).first()
+
+    async def fetch_val(self, statement, **params):
+        return (await self.session.execute(statement, params)).scalar()
+
+    async def fetch_all(self, statement, **params):
+        return (await self.session.execute(statement, params)).all()
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with self.session.begin():
+            yield
 
     def __repr__(self):
         url = self.engine.url if self.app or current_app else None
