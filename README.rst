@@ -2,10 +2,13 @@ Quart-SQLAlchemy
 ================
 
 **WARNING**
-This extension is work-in-progress and is for internal use (for now).
-It works with raw queries and is tested only on asyncpg.
-Base class implements convenience method inspired by encode/databases.
-Documentation and tests TODO.
+
+- This extension is work-in-progress and is for internal use (for now).
+- It works with raw queries and is tested only on asyncpg.
+- Base class implements convenience method inspired by encode/databases.
+- Documentation and tests TODO.
+
+---
 
 Quart-SQLAlchemy is an extension for `Quart`_ that adds support for
 `SQLAlchemy`_ to your application. It aims to simplify using SQLAlchemy
