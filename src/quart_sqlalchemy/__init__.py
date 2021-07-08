@@ -29,7 +29,7 @@ from sqlalchemy.orm import DeclarativeMeta
 
 from asyncio import current_task as _ident_func
 
-__version__ = "1.0.0"
+__version__ = "0.1.0"
 
 _signals = Namespace()
 models_committed = _signals.signal("models-committed")
